@@ -1,0 +1,208 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: todo-app
+
+jobs:
+  # ---------- Часть 1: сборка и тесты ----------
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: maven            # кэширование Maven-зависимостей (~/.m2)
+
+      - name: Build with Maven
+        run: mvn -B -DskipTests package
+
+      - name: Run tests
+        # verify = тесты + проверка покрытия JaCoCo (>= 70%, иначе сборка падает)
+        run: mvn -B verify
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: todo-jar
+          path: target/todo.jar
+          retention-days: 7
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+          retention-days: 7
+
+  # ---------- Часть 2: Docker-образ ----------
+  docker-build:
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_REPO }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------- Часть 3: деплой на VM (blue-green) ----------
+  deploy:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: ${{ secrets.VM_SSH_PORT }}
+          envs: IMAGE
+          script: |
+            set -euo pipefail
+            APP=todo
+            NET=todo-net
+            PROXY=todo-proxy
+            DIR="$HOME/todo-deploy"
+            mkdir -p "$DIR"
+
+            docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET"
+
+            # Какой цвет сейчас активен — новый запускаем в другом
+            ACTIVE=$(cat "$DIR/active_color" 2>/dev/null || echo none)
+            if [ "$ACTIVE" = "blue" ]; then NEW=green; else NEW=blue; fi
+            echo "Active: $ACTIVE -> deploying: $NEW"
+
+            # 1. Загрузка образа
+            docker pull "$IMAGE"
+
+            # 3. Запуск нового контейнера (рядом со старым, старый продолжает обслуживать трафик)
+            docker rm -f "$APP-$NEW" >/dev/null 2>&1 || true
+            docker run -d --name "$APP-$NEW" --network "$NET" --restart unless-stopped "$IMAGE"
+
+            # Ждём, пока HEALTHCHECK контейнера станет healthy
+            for i in $(seq 1 40); do
+              STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$APP-$NEW")
+              echo "health: $STATUS"
+              [ "$STATUS" = "healthy" ] && break
+              sleep 3
+            done
+            if [ "$STATUS" != "healthy" ]; then
+              echo "New container is not healthy, rollback (old one keeps serving)"
+              docker logs --tail 50 "$APP-$NEW" || true
+              docker rm -f "$APP-$NEW"
+              exit 1
+            fi
+
+            # Переключаем трафик: nginx на порту 8080 -> новый контейнер
+            cat > "$DIR/nginx.conf" <<EOF
+            server {
+              listen 8080;
+              location / {
+                proxy_pass http://$APP-$NEW:8080;
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
+              }
+            }
+            EOF
+            if docker ps --format '{{.Names}}' | grep -qx "$PROXY"; then
+              docker exec "$PROXY" nginx -t
+              docker exec "$PROXY" nginx -s reload
+            else
+              docker rm -f "$PROXY" >/dev/null 2>&1 || true
+              docker run -d --name "$PROXY" --network "$NET" --restart unless-stopped \
+                -p 8080:8080 -v "$DIR/nginx.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.27-alpine
+            fi
+            echo "$NEW" > "$DIR/active_color"
+
+            # 2. Остановка старого контейнера (оставляем остановленным для быстрого отката)
+            if [ "$ACTIVE" != "none" ]; then
+              docker stop "$APP-$ACTIVE" || true
+            fi
+
+            sleep 2
+            curl -fs http://localhost:8080/actuator/health
+            echo
+            docker image prune -f >/dev/null
+            echo "Deployed $IMAGE as $NEW"
+
+      - name: Check application is available
+        run: |
+          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors \
+            "http://${{ secrets.VM_HOST }}:8080/actuator/health"
+          echo
+          curl -fsS "http://${{ secrets.VM_HOST }}:8080/tasks"
+
+  # ---------- Уведомление о результате ----------
+  notify:
+    needs: [ build-and-test, docker-build, deploy ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build summary
+        run: |
+          {
+            echo "## Результат CI/CD"
+            echo "| Этап | Статус |"
+            echo "|---|---|"
+            echo "| Build & Test | ${{ needs.build-and-test.result }} |"
+            echo "| Docker build & push | ${{ needs.docker-build.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo ""
+            echo "Commit: \`${{ github.sha }}\` by ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Telegram notification (optional)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEXT: |
+            ${{ github.repository }}: ${{ github.workflow }}
+            build-and-test: ${{ needs.build-and-test.result }}
+            docker-build: ${{ needs.docker-build.result }}
+            deploy: ${{ needs.deploy.result }}
+            commit: ${{ github.sha }}
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set, skipping"
+            exit 0
+          fi
+          curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"
+          echo "Notification sent"
